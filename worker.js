@@ -80,6 +80,11 @@ export class LiveReviewRoom extends DurableObject {
     }
 
     reviewMessage(state, partner, input) {
+        if (input?.type === 'profile' && !state.sentProfile && typeof input.name === 'string' &&
+            input.name.trim() && input.name.length <= 120) {
+            state.sentProfile = true;
+            return { type: 'profile', name: input.name.trim() };
+        }
         if (input?.type === 'queue' && state.role === 'guest' && !state.sentQueue &&
             Array.isArray(input.ids) && input.ids.length <= 5000 &&
             input.ids.every(id => typeof id === 'string' && questionId.test(id))) {
@@ -89,8 +94,7 @@ export class LiveReviewRoom extends DurableObject {
         if (input?.type === 'rated' && !state.rated &&
             typeof input.id === 'string' && input.id === (state.role === 'host' ? state.question : partner.question)) {
             state.rated = input.id;
-            if (state.role === 'guest') return { type: 'rated', id: input.id };
-            return;
+            return { type: 'rated', id: input.id };
         }
         if (state.role !== 'host' || state.finished || !partner.sentQueue ||
             (state.question && (state.rated !== state.question || partner.rated !== state.question))) return;
