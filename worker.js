@@ -5,6 +5,11 @@ const roomLifetime = 2 * 60 * 60 * 1000;
 const roomPath = /^\/live\/([a-z0-9]{8})-([a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})\/(host|guest)$/;
 const questionId = /^[A-Za-z0-9.]{1,32}$/;
 
+function validScenarioValues(values) {
+    return Array.isArray(values) && values.length <= 20 &&
+        values.every(value => typeof value === 'string' && value.length <= 500);
+}
+
 export default {
     fetch(request, env) {
         if (request.headers.get('Origin') !== env.SITE_ORIGIN) return new Response(null, { status: 403 });
@@ -83,7 +88,9 @@ export class LiveReviewRoom extends DurableObject {
         if (input?.type === 'profile' && !state.sentProfile && typeof input.name === 'string' &&
             input.name.trim() && input.name.length <= 120) {
             state.sentProfile = true;
-            return { type: 'profile', name: input.name.trim() };
+            state.scenarioEdits = input.scenarioEdits === true;
+            state.inputTurns = input.inputTurns === true;
+            return { type: 'profile', name: input.name.trim(), scenarioEdits: state.scenarioEdits, inputTurns: state.inputTurns };
         }
         if (input?.type === 'queue' && state.role === 'guest' && !state.sentQueue &&
             Array.isArray(input.ids) && input.ids.length <= 5000 &&
@@ -91,26 +98,45 @@ export class LiveReviewRoom extends DurableObject {
             state.sentQueue = true;
             return { type: 'queue', ids: input.ids };
         }
+        const host = state.role === 'host' ? state : partner;
+        const revision = input?.revision ?? 0;
         if (input?.type === 'rated' && !state.rated &&
-            typeof input.id === 'string' && input.id === (state.role === 'host' ? state.question : partner.question)) {
+            typeof input.id === 'string' && input.id === host.question && revision === host.revision) {
             state.rated = input.id;
-            return { type: 'rated', id: input.id };
+            return { type: 'rated', id: input.id, revision };
         }
-        if (state.role !== 'host' || state.finished || !partner.sentQueue ||
-            (state.question && (state.rated !== state.question || partner.rated !== state.question))) return;
-        if (input?.type === 'done') {
+        if (input?.type === 'draft-values' && state.role === 'guest' && typeof input.id === 'string' &&
+            input.id === host.draft && state.submittedDraft !== input.id && validScenarioValues(input.values)) {
+            state.submittedDraft = input.id;
+            return { type: 'draft-values', id: input.id, values: input.values };
+        }
+        if (state.role !== 'host' || state.finished || !partner.sentQueue) return;
+
+        const roundComplete = !state.question || (state.rated === state.question && partner.rated === state.question);
+        if (input?.type === 'draft' && roundComplete && state.inputTurns && partner.inputTurns && !state.draft &&
+            typeof input.id === 'string' && questionId.test(input.id) && input.id !== state.question) {
+            state.draft = input.id;
+            return { type: 'draft', id: input.id };
+        }
+        if (input?.type === 'done' && roundComplete && !state.draft) {
             state.finished = true;
             return { type: 'done' };
         }
-        if (input?.type === 'question' && typeof input.id === 'string' && questionId.test(input.id) &&
-            input.id !== state.question && Array.isArray(input.values) && input.values.length <= 20 &&
-            input.values.every(value => typeof value === 'string' && value.length <= 500)) {
-            state.question = input.id;
-            state.rated = null;
-            // Clear the guest's previous rating so the next question can be rated independently.
-            partner.rated = null;
-            return { type: 'question', id: input.id, values: input.values };
-        }
+        if (input?.type !== 'question' || typeof input.id !== 'string' || !questionId.test(input.id) ||
+            !validScenarioValues(input.values)) return;
+
+        const revised = input.id === state.question && state.scenarioEdits && partner.scenarioEdits &&
+            revision === state.revision + 1;
+        const draftReady = !state.draft || (state.draft === input.id && partner.submittedDraft === input.id);
+        const fresh = input.id !== state.question && revision === 0 && roundComplete && draftReady;
+        if (!revised && !fresh) return;
+
+        state.question = input.id;
+        state.revision = revision;
+        state.rated = null;
+        if (fresh) state.draft = null;
+        partner.rated = null;
+        return { type: 'question', id: input.id, values: input.values, revision };
     }
 
     webSocketClose() {
