@@ -1,0 +1,13 @@
+{
+    "name": "questions-live-review",
+    "main": "worker.js",
+    "compatibility_date": "2026-11-04",
+    "workers_dev": true,
+    "preview_urls": false,
+    "observability": { "enabled": false },
+    "vars": { "SITE_ORIGIN": "https://edankow.github.io" },
+    "durable_objects": {
+        "bindings": [{ "name": "ROOMS", "class_name": "LiveReviewRoom" }]
+    },
+    "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LiveReviewRoom"] }]
+}
