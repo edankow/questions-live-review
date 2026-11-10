@@ -10,6 +10,15 @@ function validScenarioValues(values) {
         values.every(value => typeof value === 'string' && value.length <= 500);
 }
 
+function endedLiveResponse() {
+    // A browser cannot read an HTTP error from a failed WebSocket handshake.
+    const { 0: client, 1: server } = new WebSocketPair();
+    server.accept();
+    server.send(JSON.stringify({ type: 'ended' }));
+    server.close(1000, 'Room closed');
+    return new Response(null, { status: 101, webSocket: client });
+}
+
 export default {
     fetch(request, env) {
         if (request.headers.get('Origin') !== env.SITE_ORIGIN) return new Response(null, { status: 403 });
@@ -20,43 +29,85 @@ export default {
         }
         const [, created, id] = room;
         const age = Date.now() - parseInt(created, 36);
-        if (age < -60000 || age > inviteLifetime) return new Response(null, { status: 410 });
+        if (age < -60000 || age > roomLifetime) return endedLiveResponse();
         return env.ROOMS.getByName(created + '-' + id).fetch(request);
     }
 };
 
 export class LiveReviewRoom extends DurableObject {
     async fetch(request) {
-        const host = new URL(request.url).pathname.endsWith('/host');
-        const sockets = this.ctx.getWebSockets();
-        if (host) {
-            if (sockets.length || await this.ctx.storage.get('created')) return new Response(null, { status: 409 });
-            await this.ctx.storage.put('created', true);
-            await this.ctx.storage.setAlarm(Date.now() + roomLifetime);
-        } else if (sockets.length !== 1 || sockets[0].readyState !== WebSocket.OPEN ||
-                   sockets[0].deserializeAttachment()?.role !== 'host' ||
-                   await this.ctx.storage.get('joined')) {
-            return new Response(null, { status: 409 });
+        const url = new URL(request.url);
+        const role = url.pathname.endsWith('/host') ? 'host' : 'guest';
+        const otherRole = role === 'host' ? 'guest' : 'host';
+        const token = url.searchParams.get('token');
+        if (token && !/^[a-f0-9-]{36}$/.test(token)) return new Response(null, { status: 400 });
+        if (await this.ctx.storage.get('closed')) return endedLiveResponse();
+        let state = await this.roleState(role);
+        const partner = await this.roleState(otherRole);
+        if ((state || partner) && !this.peer('host') && !this.peer('guest')) {
+            await this.closeRoom();
+            return endedLiveResponse();
+        }
+        const resumed = Boolean(state);
+        if (resumed) {
+            if (!state.token || token !== state.token) return new Response(null, { status: 403 });
         } else {
-            await this.ctx.storage.put('joined', true);
+            const created = parseInt(url.pathname.split('/')[2].split('-')[0], 36);
+            if (Date.now() - created > inviteLifetime) return endedLiveResponse();
+            if (role === 'guest' && !partner) return new Response(null, { status: 409 });
+            if (role === 'host' && await this.ctx.storage.get('created')) return new Response(null, { status: 409 });
+            state = { role, token, inbox: [], nextDelivery: 0, lastClientSeq: 0 };
+        }
+        if (role === 'host' && !resumed) {
+            await this.ctx.storage.put('created', true);
+            await this.ctx.storage.setAlarm(parseInt(url.pathname.split('/')[2].split('-')[0], 36) + roomLifetime);
         }
 
+        const oldSockets = this.ctx.getWebSockets(role);
         const { 0: client, 1: server } = new WebSocketPair();
-        const role = host ? 'host' : 'guest';
+        state.connection = crypto.randomUUID();
+        state.windowStart = Date.now();
+        state.count = 0;
+        await this.ctx.storage.put(role, state);
         this.ctx.acceptWebSocket(server, [role]);
-        server.serializeAttachment({ role, windowStart: Date.now(), count: 0 });
-        if (host) {
+        server.serializeAttachment({ role, connection: state.connection });
+        for (const socket of oldSockets) socket.close(4001, 'Replaced by reconnect');
+        const peer = this.peer(otherRole);
+        if (resumed) {
+            server.send(JSON.stringify({ type: 'resumed', paired: Boolean(partner), partnerOnline: Boolean(peer) }));
+            for (const message of state.inbox) server.send(JSON.stringify(message));
+            if (peer) peer.send(JSON.stringify({ type: 'partner-reconnected' }));
+        } else if (role === 'host') {
             server.send(JSON.stringify({ type: 'inviting' }));
         } else {
             const connected = JSON.stringify({ type: 'connected' });
-            sockets[0].send(connected);
+            if (peer) peer.send(connected);
             server.send(connected);
         }
         return new Response(null, { status: 101, webSocket: client });
     }
 
-    webSocketMessage(socket, raw) {
-        const state = socket.deserializeAttachment();
+    peer(role) {
+        return this.ctx.getWebSockets(role).find(socket => socket.readyState === WebSocket.OPEN);
+    }
+
+    async roleState(role) {
+        let state = await this.ctx.storage.get(role);
+        if (state) return state;
+        // Preserve rooms opened by the previous Worker version during rollout.
+        const socket = this.peer(role);
+        const attachment = socket?.deserializeAttachment();
+        if (!attachment || attachment.connection) return;
+        state = { inbox: [], nextDelivery: 0, lastClientSeq: 0, token: null, ...attachment, connection: crypto.randomUUID() };
+        socket.serializeAttachment({ role, connection: state.connection });
+        await this.ctx.storage.put(role, state);
+        return state;
+    }
+
+    async webSocketMessage(socket, raw) {
+        const state = await this.roleState(socket.deserializeAttachment().role);
+        const attachment = socket.deserializeAttachment();
+        if (!state || state.connection !== attachment.connection || await this.ctx.storage.get('closed')) return;
         const now = Date.now();
         if (now - state.windowStart >= 1000) {
             state.windowStart = now;
@@ -66,21 +117,47 @@ export class LiveReviewRoom extends DurableObject {
             socket.close(1008, 'Message limit exceeded');
             return;
         }
-        socket.serializeAttachment(state);
-        const peer = this.ctx.getWebSockets(state.role === 'host' ? 'guest' : 'host')[0];
-        if (!peer || peer.readyState !== WebSocket.OPEN) return;
+        await this.ctx.storage.put(state.role, state);
         let input;
         try {
             input = JSON.parse(raw);
         } catch {
             return;
         }
-        const partner = peer.deserializeAttachment();
+        if (input?.type === 'leave') {
+            await this.closeRoom();
+            return;
+        }
+        if (input?.type === 'ack' && Number.isSafeInteger(input.serverSeq) && input.serverSeq <= state.nextDelivery) {
+            state.inbox = state.inbox.filter(message => message.serverSeq > input.serverSeq);
+            await this.ctx.storage.put(state.role, state);
+            return;
+        }
+        if (state.token) {
+            if (!Number.isSafeInteger(input?.clientSeq) || input.clientSeq < 1 || input.clientSeq > state.lastClientSeq + 1) return;
+            if (input.clientSeq <= state.lastClientSeq) {
+                socket.send(JSON.stringify({ type: 'ack', clientSeq: input.clientSeq }));
+                return;
+            }
+            state.lastClientSeq = input.clientSeq;
+        }
+        const otherRole = state.role === 'host' ? 'guest' : 'host';
+        const partner = await this.roleState(otherRole);
+        if (!partner) return;
         const message = this.reviewMessage(state, partner, input);
-        socket.serializeAttachment(state);
+        if (message && partner.token) {
+            message.serverSeq = ++partner.nextDelivery;
+            partner.inbox.push(message);
+            if (partner.inbox.length > 64 || JSON.stringify(partner).length > 120000) {
+                await this.closeRoom();
+                return;
+            }
+        }
+        await this.ctx.storage.put({ [state.role]: state, [otherRole]: partner });
+        if (state.token) socket.send(JSON.stringify({ type: 'ack', clientSeq: input.clientSeq }));
         if (message) {
-            if (message.type === 'question') peer.serializeAttachment(partner);
-            peer.send(JSON.stringify(message));
+            const peer = this.peer(otherRole);
+            if (peer) peer.send(JSON.stringify(message));
         }
     }
 
@@ -139,20 +216,36 @@ export class LiveReviewRoom extends DurableObject {
         return { type: 'question', id: input.id, values: input.values, revision };
     }
 
-    webSocketClose() {
-        this.closeRoom();
+    async webSocketClose(socket) {
+        const attachment = socket.deserializeAttachment();
+        if (!attachment.connection) {
+            await this.closeRoom();
+            return;
+        }
+        const state = await this.ctx.storage.get(attachment.role);
+        if (!state || state.connection !== attachment.connection || await this.ctx.storage.get('closed')) return;
+        if (!state.token) {
+            await this.closeRoom();
+            return;
+        }
+        const peer = this.peer(state.role === 'host' ? 'guest' : 'host');
+        if (peer) peer.send(JSON.stringify({ type: 'partner-disconnected' }));
+        else await this.closeRoom();
     }
 
-    webSocketError() {
-        this.closeRoom();
+    async webSocketError(socket) {
+        await this.webSocketClose(socket);
+        socket.close(1011, 'Connection interrupted');
     }
 
-    closeRoom() {
+    async closeRoom() {
+        await this.ctx.storage.put('closed', true);
+        await this.ctx.storage.delete(['host', 'guest']);
         for (const socket of this.ctx.getWebSockets()) socket.close(1000, 'Room closed');
     }
 
     async alarm() {
-        this.closeRoom();
+        await this.closeRoom();
         await this.ctx.storage.deleteAll();
     }
 }
