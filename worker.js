@@ -175,6 +175,13 @@ export class LiveReviewRoom extends DurableObject {
             state.sentQueue = true;
             return { type: 'queue', ids: input.ids };
         }
+        if (input?.type === 'chapter-summary' && state.role === 'host' && partner.sentQueue &&
+            Number.isSafeInteger(input.count) && input.count >= 0 && input.count <= 5000 &&
+            (input.filter === 'all' || (Array.isArray(input.filter) && input.filter.length > 0 &&
+                input.filter.length <= 5000 &&
+                input.filter.every(chapter => typeof chapter === 'string' && /^\d{1,4}$/.test(chapter))))) {
+            return { type: 'chapter-summary', filter: input.filter, count: input.count };
+        }
         const host = state.role === 'host' ? state : partner;
         const revision = input?.revision ?? 0;
         if (input?.type === 'rated' && !state.rated &&
